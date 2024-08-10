@@ -1,0 +1,173 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+modelling <- read.csv("train.csv")
+submitting <- read.csv("test.csv")
+```
+
+```{r}
+clean.numeric <- function(df) {
+  return (df %>%
+            mutate_if(is.numeric, 
+                      function(x) ifelse(is.na(x) | x > 200, median(x, na.rm = TRUE), x)))
+}
+clean.categories <- function(df) {
+  return (df %>%
+            mutate_if(is.character, function(x) {
+              ifelse(nchar(x) == 1 & grepl("[a-z]", x), x, NA)
+            }))
+}
+
+fill.with.cap.diameter <- function(df) {
+  return (
+    data.frame(
+      df %>%
+        group_by(cut_interval(cap.diameter, n = 5)) %>%
+        fill(cap.shape) %>%
+        fill(cap.surface) %>%
+        fill(cap.color) %>%
+        ungroup()
+    )
+  )
+}
+fill.with.stem.width <- function(df) {
+  return (
+    data.frame(
+      df %>%
+        group_by(cut_interval(stem.width, n = 5)) %>%
+        fill(gill.attachment) %>%
+        fill(gill.spacing) %>%
+        fill(gill.color) %>%
+        fill(stem.color) %>%
+        fill(ring.type) %>%
+        ungroup()
+    )
+  )
+}
+
+fill.with.stem.height <- function(df) {
+  return (
+    data.frame(
+      df %>%
+        group_by(cut_interval(stem.height, n = 5)) %>%
+        fill(habitat) %>%
+        ungroup()
+    )
+  )
+}
+
+clean.ring <- function(df) {
+  ring <- df$has.ring
+  ring <- ifelse(!is.na(ring) & ring != "f", "t", ring)
+  ring <- ifelse(is.na(ring) & !is.na(df$ring.type) & df$ring.type != "f", "t", ring)
+  ring <- replace_na(ring, "f")
+  
+  ring.type <- df$ring.type
+  ring.type <- ifelse(ring == "f", "f", ring.type)
+  
+  return (
+    data.frame(
+      df %>%
+        mutate(has.ring = ring, ring.type = ring.type) %>%
+        group_by(has.ring) %>%
+        fill(ring.type) %>%
+        ungroup()
+    )
+  )
+}
+
+clean.bruise <- function(df) {
+  bruise <- df$does.bruise.or.bleed
+  bruise <- ifelse(!is.na(bruise) & bruise != "f", "t", bruise)
+  bruise <- replace_na(bruise, "f")
+  return (df %>%
+            mutate(does.bruise.or.bleed = bruise))
+}
+
+fill.with.mode <- function(df) {
+  return (df %>%
+            mutate_if(is.character, function(x) replace_na(x, Mode(x, na.rm = TRUE))))
+}
+fill.global <- function(df) {
+  return (
+    df %>%
+      mutate_at(vars(stem.root, stem.surface, veil.type, veil.color, spore.print.color),
+                function(x) replace_na(x, "0"))
+  )
+}
+preprocess <- function(df, train = TRUE) {
+  new.df <- df %>%
+      clean.numeric() %>%
+      clean.categories() %>%
+      fill.with.cap.diameter() %>%
+      fill.with.stem.width() %>%
+      fill.with.stem.height() %>%
+      clean.ring() %>%
+      clean.bruise() %>%
+      fill.with.mode() %>%
+      fill.global() %>%
+      select(-contains("cut_interval")) %>%
+      mutate_if(is.numeric, log1p)
+  if (train) {
+    return (
+       new.df %>%
+        mutate(class = ifelse(class == "p", 1, 0))
+    )
+  }
+  return (new.df)
+}
+```
+
+```{r}
+df <- preprocess(modelling)
+check.na(df)
+```
+```{r}
+test_ind <- createDataPartition(df$class, p = 0.3, list = FALSE)
+train <- df[-test_ind, ]
+test <- df[test_ind, ]
+```
+
+```{r}
+train.input <- xg.input.prepare(train)
+xg_3 <- xgboost(train.input, train$class, 
+                params = list(
+                  eta = 0.4, 
+                  gamma = 0.04,
+                  subsample = 0.5
+                ),
+                nrounds = 70,
+                objective = "binary:hinge")
+
+confusionMatrix(as.factor(predict(xg_3, xg.input.prepare(test))), as.factor(test$class))
+```
+```{r}
+test.input <- submitting %>%
+  preprocess(train = FALSE) %>%
+  xg.input.prepare(train = FALSE)
+
+submission_3 <- data.frame(
+  id = submitting$id,
+  class = ifelse(predict(xg_3, test.input) == 1, "p", "e")
+)
+write.csv(submission_3, "submission_3.csv", row.names = FALSE)
+```
+
+```{r}
+s1 <- read.csv("submission_1.csv")
+s2 <- read.csv("submission_2.csv")
+s3 <- read.csv("submission_3.csv")
+```
+
+```{r}
+s <- cbind(s1,select(s2, -id), select(s3, -id))
+p_hat <- apply(s, 1, function(x) ifelse(mean(x == "p") > 0.5, "p", "e"))
+submission_4 <- data.frame(
+  id = s$id, 
+  class = p_hat
+)
+write.csv(submission_4, "submission_4.csv", row.names = FALSE)
+```
+

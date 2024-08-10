@@ -1,0 +1,270 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(caret)
+library(DescTools)
+library(mice)
+```
+
+```{r}
+modelling <- read.csv("train.csv", na.strings = "")
+submitting <- read.csv("test.csv", na.strings = "")
+```
+
+```{r}
+check.na <- function(df) {
+  apply(df, 2, function(x) sum(is.na(x)))
+}
+```
+
+```{r}
+check.na(modelling)
+```
+
+```{r}
+check.na(submitting)
+```
+```{r}
+df <- modelling
+for (col in colnames(df)) {
+  if (is.character(df[[col]])) {
+    print(paste(col, ":"))
+    print(paste("number of distinct: ", n_distinct(df[[col]])))
+    print(unique(df[[col]]))
+  }
+}
+```
+
+```{r}
+df %>%
+  group_by(cap.color) %>%
+  summarize(cap.d = mean(cap.diameter, na.rm = TRUE),
+            n = n()) %>%
+  arrange(desc(n))
+```
+```{r}
+df %>%
+  filter(grepl("[0-9]", gill.spacing)) %>%
+  mutate(temp = as.numeric(gill.spacing)) %>%
+  pivot_longer(cols = c("cap.diameter", "stem.width", "stem.height"),
+               names_to = "Numeric", values_to = "Value") %>%
+  ggplot() +
+  geom_jitter(aes(temp, Value)) +
+  geom_smooth(aes(temp, Value), method = "lm", se = FALSE) +
+  facet_wrap(~ Numeric, scales = "free")
+```
+
+```{r}
+ggplot(df, aes(stem.height)) +
+  geom_density(aes(color = class, fill = class), alpha = 0.4)
+```
+
+```{r}
+df %>%
+  mutate(cap.d = log1p(stem.height)) %>%
+  ggplot() +
+  geom_density(aes(cap.d))
+```
+
+Preprocessing funcs
+```{r}
+drop.na.columns <- function(df) {
+  return (df %>% select(-stem.root, -stem.surface, -veil.type, -veil.color, -spore.print.color))
+}
+clean.numeric <- function(df) {
+  return (df %>%
+            mutate_if(is.numeric, function(x) replace_na(x, median(x, na.rm = TRUE))))
+}
+clean.categories <- function(df) {
+  return (df %>%
+            mutate_if(is.character, function(x) {
+              ifelse(nchar(x) == 1 & grepl("[a-z]", x), x, NA)
+            }))
+}
+
+fill.with.cap.diameter <- function(df) {
+  return (
+    data.frame(
+      df %>%
+        group_by(cut_interval(cap.diameter, n = 5)) %>%
+        fill(cap.shape) %>%
+        fill(cap.surface) %>%
+        fill(cap.color) %>%
+        ungroup()
+    )
+  )
+}
+fill.with.stem.width <- function(df) {
+  return (
+    data.frame(
+      df %>%
+        group_by(cut_interval(stem.width, n = 5)) %>%
+        fill(gill.attachment) %>%
+        fill(gill.spacing) %>%
+        fill(gill.color) %>%
+        fill(stem.color) %>%
+        fill(ring.type) %>%
+        ungroup()
+    )
+  )
+}
+
+fill.with.stem.height <- function(df) {
+  return (
+    data.frame(
+      df %>%
+        group_by(cut_interval(stem.height, n = 5)) %>%
+        fill(habitat) %>%
+        ungroup()
+    )
+  )
+}
+
+clean.ring <- function(df) {
+  ring <- df$has.ring
+  ring <- ifelse(!is.na(ring) & ring != "f", "t", ring)
+  ring <- ifelse(is.na(ring) & !is.na(df$ring.type) & df$ring.type != "f", "t", ring)
+  ring <- replace_na(ring, "f")
+  
+  ring.type <- df$ring.type
+  ring.type <- ifelse(ring == "f", "f", ring.type)
+  
+  return (
+    data.frame(
+      df %>%
+        mutate(has.ring = ring, ring.type = ring.type) %>%
+        group_by(has.ring) %>%
+        fill(ring.type) %>%
+        ungroup()
+    )
+  )
+}
+
+clean.bruise <- function(df) {
+  bruise <- df$does.bruise.or.bleed
+  bruise <- ifelse(!is.na(bruise) & bruise != "f", "t", bruise)
+  bruise <- replace_na(bruise, "f")
+  return (df %>%
+            mutate(does.bruise.or.bleed = bruise))
+}
+
+fill.with.mode <- function(df) {
+  return (df %>%
+            mutate_if(is.character, function(x) replace_na(x, Mode(x, na.rm = TRUE))))
+}
+
+preprocess <- function(df, train = TRUE) {
+  new.df <- df %>%
+      drop.na.columns() %>%
+      clean.numeric() %>%
+      clean.categories() %>%
+      fill.with.cap.diameter() %>%
+      fill.with.stem.width() %>%
+      fill.with.stem.height() %>%
+      clean.ring() %>%
+      clean.bruise() %>%
+      fill.with.mode() %>%
+      select(-contains("cut_interval")) %>%
+      mutate_if(is.numeric, log1p)
+  if (train) {
+    return (
+       new.df %>%
+        mutate(class = ifelse(class == "p", 1, 0))
+    )
+  }
+  return (new.df)
+}
+```
+
+```{r}
+new_df <- preprocess(df)
+check.na(new_df)
+```
+```{r}
+xg.input.prepare <- function(df, train = TRUE) {
+  new.df <- df %>%
+              mutate_if(is.character, as.factor) %>%
+              mutate_if(is.factor, as.numeric)
+  if (train) {
+    return (
+      as.matrix(
+       new.df %>%
+          select(-id, -class)
+      )
+    )
+  }
+  return (
+    as.matrix(
+        new.df %>%
+          select(-id)
+      )
+  )
+}
+```
+
+```{r}
+test_id <- createDataPartition(new_df$class, p = 0.3, list = FALSE)
+train <- new_df[-test_id, ]
+test <- new_df[test_id, ]
+```
+
+
+```{r}
+modelLookup("xgbTree")
+grid <- expand.grid(
+  nrounds = seq(10, 50, 10),
+  max_depth = seq(4, 8, 2),
+  eta = 0.3,
+  gamma = seq(0, 0.05, 0.01),
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 0.5
+)
+trControl <- trainControl(method = "cv", number = 5, verboseIter = FALSE, allowParallel = TRUE)
+
+input <- xg.input.prepare(train)
+xg <- train(input, as.factor(train$class),
+            method = "xgbTree",
+            trControl = trControl,
+            tuneGrid = grid)
+```
+```{r}
+xg$bestTune
+pred <- predict(xg, xg.input.prepare(test))
+confusionMatrix(pred, as.factor(test$class))
+confusionMatrix(predict(xg, input), as.factor(train$class))
+```
+
+```{r}
+library(xgboost)
+xg_ <- xgboost(input, train$class, 
+               params = list(
+                 max_depth = 8,
+                 eta = 0.3, 
+                 gamma = 0.04,
+                 colsample_bytree = 1,
+                 min_child_weight = 1,
+                 subsample = 0.5
+               ), 
+               nrounds = 70,
+               objective = "binary:hinge",
+               verbose = 0)
+pred_ <- predict(xg, xg.input.prepare(test))
+confusionMatrix(pred_, as.factor(test$class))
+```
+```{r}
+testing <- preprocess(submitting, train = FALSE)
+input_ <- xg.input.prepare(testing, train = FALSE)
+
+pred_1 <- predict(xg_, input_)
+submission_1 <- data.frame(
+  id = submitting$id,
+  class = ifelse(pred_1 == "1", "p", "e")
+)
+write.csv(submission_1, "submission_1.csv", row.names = FALSE)
+```
+
